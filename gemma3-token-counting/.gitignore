@@ -1,0 +1,3 @@
+# Exclude the downloaded tokenizer model (fetched during investigation)
+# Per AGENTS.md: "Do NOT include full copies of code that you fetched"
+gemma3_cleaned_262144_v2.spiece.model
