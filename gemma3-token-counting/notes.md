@@ -69,3 +69,29 @@ token_counts = [len(sp.encode(text)) for text in texts]
 ```
 
 For 500 texts, batch processing is **4x faster**!
+
+### Additional Findings: Protobuf Methods
+
+Tested `encode_as_immutable_proto()` and `encode_as_serialized_proto()`:
+
+1. **encode_as_immutable_proto()** returns rich metadata:
+   - Each token includes: piece, id, surface form, begin/end positions
+   - Can count tokens via `len(proto.pieces)`
+   - ~15% slower than `encode()` for counting
+   - **Use case**: When you need token positions or surface forms
+
+2. **encode_as_serialized_proto()** returns raw bytes:
+   - Protobuf serialization format
+   - Similar performance to other methods
+   - Needs parsing to extract count (not recommended for counting)
+
+3. **Batch size matters for native batching**:
+   - At batch size 10: List comp is **39x faster** than native batch (4.84 vs 190.36 μs/text)
+   - At batch size 100: List comp is **3.3x faster** (10.94 vs 36.49 μs/text)
+   - At batch size 500: Native batch is **1.3x faster** (8.62 vs 11.23 μs/text)
+   - **Crossover point**: ~200-300 texts
+
+**Updated recommendation**:
+- For batches < 200: Use list comprehension `[len(sp.encode(t)) for t in texts]`
+- For batches ≥ 200: Use native batching `[len(enc) for enc in sp.encode(texts)]`
+- For metadata (positions): Use `encode_as_immutable_proto()`

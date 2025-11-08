@@ -15,15 +15,24 @@ import sentencepiece as spm
 sp = spm.SentencePieceProcessor()
 sp.load('gemma3_cleaned_262144_v2.spiece.model')
 
-# FAST: Batch processing (recommended)
-texts = ["text 1", "text 2", "text 3", ...]
-token_counts = [len(enc) for enc in sp.encode(texts)]
+# FASTEST: Depends on batch size!
+texts = ["text 1", "text 2", ...]
 
-# SLOW: Individual processing (avoid)
-token_counts = [len(sp.encode(text)) for text in texts]
+# For small batches (< 200 texts): List comprehension
+if len(texts) < 200:
+    token_counts = [len(sp.encode(t)) for t in texts]
+
+# For large batches (>= 200 texts): Native batching
+else:
+    token_counts = [len(enc) for enc in sp.encode(texts)]
+
+# For token positions/metadata: Use immutable proto
+protos = [sp.encode_as_immutable_proto(t) for t in texts]
+token_counts = [len(p.pieces) for p in protos]
+# Each proto.pieces[i] has: .piece, .id, .surface, .begin, .end
 ```
 
-**Performance gain: 4x at batch size 500, up to 30x at batch size 1000**
+**Performance gain varies by batch size - see detailed benchmarks below**
 
 ## Benchmark Results
 
@@ -31,27 +40,43 @@ token_counts = [len(sp.encode(text)) for text in texts]
 
 For a single 100-character text:
 
-| Method | Time (μs) | Relative Performance |
-|--------|-----------|---------------------|
-| `encode()` | 17.04 | Baseline (best) |
-| `encode_as_ids()` | 17.41 | +2% (identical) |
-| `encode_as_pieces()` | 20.02 | +17% (slower) |
+| Method | Time (μs) | Relative Performance | Notes |
+|--------|-----------|---------------------|-------|
+| `encode()` | 17.04 | Baseline (best) | Returns token IDs |
+| `encode_as_ids()` | 17.41 | +2% (identical) | Same as encode() |
+| `encode_as_pieces()` | 20.02 | +17% (slower) | Returns token strings |
+| `encode_as_immutable_proto()` | 20.02 | +15% (slower) | Returns rich metadata |
 
-**Recommendation:** Use `encode()` or `encode_as_ids()`. Avoid `encode_as_pieces()` if you only need counts.
+**Recommendation:**
+- For counting only: Use `encode()` or `encode_as_ids()`
+- For token positions/metadata: Use `encode_as_immutable_proto()`
+- Avoid `encode_as_pieces()` unless you need token strings
 
 ### 2. Batch vs Individual Processing
 
-Critical performance difference:
+**IMPORTANT DISCOVERY:** Native batch encoding has overhead that only pays off at larger batch sizes!
 
-| Batch Size | Individual (μs) | Batch (μs) | Speedup |
-|------------|-----------------|------------|---------|
-| 1 | 16.92 | 58.01 | 0.29x |
-| 10 | 338.49 | 1761.44 | 0.19x |
-| 50 | 2017.72 | 3635.43 | 0.56x |
-| 100 | 3614.33 | 3642.41 | 0.99x |
-| **500** | **18311.63** | **4532.07** | **4.04x** |
+| Batch Size | List Comp (μs/text) | Native Batch (μs/text) | Best Method |
+|------------|---------------------|------------------------|-------------|
+| 10 | **4.84** | 190.36 | List comp (39x faster!) |
+| 50 | **9.76** | 65.75 | List comp (6.7x faster) |
+| 100 | **10.94** | 36.49 | List comp (3.3x faster) |
+| 500 | 11.23 | **8.62** | Native batch (1.3x faster) |
 
-**Key insight:** Batching overhead is amortized at larger batch sizes, resulting in dramatic speedups.
+**Key insights:**
+1. **Crossover point: ~200-300 texts** - below this, list comprehension is faster
+2. Native batch `sp.encode(texts)` has initialization overhead
+3. For small batches, the overhead dominates the performance
+4. For large batches (500+), native batching wins
+
+**Updated recommendation:**
+```python
+# Small batches (< 200): Use list comprehension
+counts = [len(sp.encode(t)) for t in texts]
+
+# Large batches (>= 200): Use native batching
+counts = [len(enc) for enc in sp.encode(texts)]
+```
 
 ### 3. Optimal Batch Size Analysis
 
@@ -113,9 +138,35 @@ Surprisingly, there's **no performance difference**:
 - **Throughput:** Linear improvement up to ~1000 texts, then plateaus
 - **Latency:** Increases with batch size (wait for full batch)
 
+### 6. Immutable Proto for Rich Metadata
+
+The `encode_as_immutable_proto()` method provides additional token information:
+
+```python
+proto = sp.encode_as_immutable_proto("Hello world!")
+
+# Access token count
+token_count = len(proto.pieces)  # 3 tokens
+
+# Access rich metadata for each token
+for piece in proto.pieces:
+    print(f"Token: {piece.piece}")        # e.g., "Hello"
+    print(f"ID: {piece.id}")               # e.g., 9259
+    print(f"Surface: {piece.surface}")     # e.g., "Hello"
+    print(f"Span: [{piece.begin}, {piece.end})")  # e.g., [0, 5)
+```
+
+**Performance:** ~15% slower than `encode()` but provides character positions and surface forms.
+
+**Use cases:**
+- Highlighting specific tokens in UI
+- Token-level alignment with original text
+- Debugging tokenization behavior
+- Building token visualizers
+
 ## Implementation Patterns
 
-### Pattern 1: Simple Batch Processing
+### Pattern 1: Adaptive Batch Processing
 
 ```python
 import sentencepiece as spm
@@ -124,36 +175,56 @@ sp = spm.SentencePieceProcessor()
 sp.load('gemma3_cleaned_262144_v2.spiece.model')
 
 def count_tokens_batch(texts: list[str]) -> list[int]:
-    """Count tokens for multiple texts efficiently."""
-    return [len(enc) for enc in sp.encode(texts)]
+    """Count tokens for multiple texts efficiently.
+
+    Automatically chooses the best method based on batch size.
+    """
+    if len(texts) < 200:
+        # Small batches: list comprehension is faster
+        return [len(sp.encode(t)) for t in texts]
+    else:
+        # Large batches: native batching is faster
+        return [len(enc) for enc in sp.encode(texts)]
 
 # Usage
 texts = ["Hello world", "Another text", "And another"]
 counts = count_tokens_batch(texts)
 ```
 
-### Pattern 2: Streaming with Batching
+### Pattern 2: Streaming with Adaptive Batching
 
 ```python
-def count_tokens_stream(texts_iter, batch_size=500):
-    """Process a stream of texts in batches."""
+def count_tokens_stream(texts_iter, batch_size=300):
+    """Process a stream of texts in batches.
+
+    Default batch_size=300 balances latency and throughput.
+    """
     batch = []
     for text in texts_iter:
         batch.append(text)
         if len(batch) >= batch_size:
-            encoded = sp.encode(batch)
-            for enc in encoded:
-                yield len(enc)
+            # Use appropriate method based on batch size
+            if len(batch) < 200:
+                counts = [len(sp.encode(t)) for t in batch]
+            else:
+                counts = [len(enc) for enc in sp.encode(batch)]
+
+            for count in counts:
+                yield count
             batch = []
 
     # Process remaining
     if batch:
-        encoded = sp.encode(batch)
-        for enc in encoded:
-            yield len(enc)
+        if len(batch) < 200:
+            counts = [len(sp.encode(t)) for t in batch]
+        else:
+            counts = [len(enc) for enc in sp.encode(batch)]
+
+        for count in counts:
+            yield count
 
 # Usage
-counts = list(count_tokens_stream(large_text_iterator, batch_size=500))
+counts = list(count_tokens_stream(large_text_iterator, batch_size=300))
 ```
 
 ### Pattern 3: Async Batching
@@ -209,11 +280,13 @@ async def count_tokens_async(texts: list[str], batch_size=200) -> list[int]:
 
 ### Optimization Checklist
 
-- [ ] Use `encode()` or `encode_as_ids()` (not `encode_as_pieces()`)
-- [ ] Batch process whenever possible (minimum batch size: 50)
-- [ ] Choose batch size based on latency requirements
-- [ ] For streaming data, use batching pattern with configurable batch size
+- [ ] Use `encode()` or `encode_as_ids()` for counting (not `encode_as_pieces()`)
+- [ ] For batches < 200: Use list comprehension `[len(sp.encode(t)) for t in texts]`
+- [ ] For batches ≥ 200: Use native batching `[len(enc) for enc in sp.encode(texts)]`
+- [ ] For token metadata: Use `encode_as_immutable_proto()` (positions, surface forms)
+- [ ] For streaming data, use adaptive batching pattern
 - [ ] Don't optimize count vs full list (no difference)
+- [ ] Consider caching for repeated texts
 
 ## Limitations & Caveats
 
@@ -224,11 +297,13 @@ async def count_tokens_async(texts: list[str], batch_size=200) -> list[int]:
 
 ## Files in This Investigation
 
-- `benchmark.py` - Comprehensive benchmark script
+- `benchmark.py` - Comprehensive benchmark script (6 test scenarios)
+- `benchmark_proto.py` - Protobuf encoding methods benchmark
+- `benchmark_proto_detailed.py` - Detailed analysis of immutable proto
 - `explore_api.py` - SentencePiece API exploration
 - `notes.md` - Investigation notes and findings
 - `README.md` - This report
-- `gemma3_cleaned_262144_v2.spiece.model` - Gemma3 tokenizer (4.5MB)
+- `gemma3_cleaned_262144_v2.spiece.model` - Gemma3 tokenizer (4.5MB, not in repo)
 
 ## Reproducibility
 
@@ -247,6 +322,12 @@ python benchmark.py
 
 ## Conclusion
 
-**Batching is critical for optimal Gemma3 token counting performance.** Using batch processing with 500-1000 texts provides 4-30x speedup over individual processing. For production use, implement a batching pattern appropriate to your latency and throughput requirements.
+**Batch size matters more than expected!** The optimal approach depends on your batch size:
 
-The single most important optimization: **Always batch your token counting operations.**
+1. **Small batches (< 200 texts):** Use list comprehension - it's significantly faster due to native batch overhead
+2. **Large batches (≥ 200 texts):** Use native batching - the overhead is amortized and you get better throughput
+3. **Need metadata:** Use `encode_as_immutable_proto()` for token positions and surface forms
+
+The most important optimization: **Choose the right batching strategy for your workload.**
+
+For production use, implement adaptive batching that switches between strategies based on batch size, and choose batch sizes around 200-500 to balance latency and throughput.
