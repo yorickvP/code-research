@@ -212,3 +212,50 @@ different API surface. Additionally, `nix_2_32` is absent from nixos-25.05 (only
 to nix_2_30); users must use nixos-unstable. Neither the crate README nor flake.nix
 document this. A build.rs check against `pkg-config --modversion nix-expr-c` and a clearer
 README section on nixpkgs requirements would prevent silent mismatch.
+
+## nix-bindings-macros: proc-macro implementation
+
+Created `plugin/nix-bindings-macros/` — a proc-macro crate that generates all
+registration boilerplate from a single attribute.
+
+### Design decisions
+
+**Two modes: manual vs auto-register**
+
+`#[ctor]`-based auto-registration only makes sense for `cdylib` plugins. A library
+that embeds Nix (e.g. a custom Nix-based tool) would want to call registration at a
+specific point in startup code. So the macro always generates a safe
+`register_<fn_name>() -> Result<(), String>` function, and auto-registers via `#[ctor]`
+only when `auto_register = true` is set.
+
+**User writes 4 params, macro prepends `_nix_user_data`**
+
+The user writes an `unsafe fn` with the 4 meaningful params (`ctx`, `state`, `args`, `ret`).
+The macro converts it to `unsafe extern "C" fn` with `_nix_user_data: *mut c_void` prepended
+to match the `PrimOpFun` C typedef. This is explicit and the function is valid Rust on its own.
+
+**Generated code (for `auto_register = true`)**
+
+```rust
+// 1. The extern "C" primop callback (user body unchanged, _nix_user_data prepended)
+unsafe extern "C" fn hello_world(_nix_user_data: *mut c_void, ctx: ..., ...) { ... }
+
+// 2. Safe registration function (always generated)
+fn register_hello_world() -> Result<(), String> {
+    // creates context, calls nix_alloc_primop + nix_register_primop, frees context
+}
+
+// 3. ctor (only when auto_register = true; requires `ctor` in [dependencies])
+#[ctor::ctor]
+fn __nix_ctor_hello_world() {
+    if let Err(e) = register_hello_world() { eprintln!("nix plugin: {e}"); }
+}
+```
+
+### Verified working
+
+Running `nix eval --plugin-files ./libnix_hello_world_plugin.so --expr 'builtins.helloWorld null'`
+produces `"Hello, World!"` with the macro-rewritten plugin.
+
+Symbol inspection confirms `.init_array` has 3 entries (Rust runtime init + our ctor)
+and `hello_world` is compiled with the correct `extern "C"` ABI for use as a function pointer.

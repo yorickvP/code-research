@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "nix-bindings-macros"]
+resolver = "2"
+
 [package]
 name = "nix-hello-world-plugin"
 version = "0.1.0"
@@ -10,11 +14,9 @@ name = "nix_hello_world_plugin"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Raw FFI bindings to the Nix C API (from the notashelf/nix-bindings repo).
-# The crate is not separately published to crates.io, so we reference the git repo
-# directly. Cargo resolves workspace members by crate name.
 nix-bindings-sys = { git = "https://github.com/notashelf/nix-bindings", version = "2.32.4" }
-# Provides Rust global constructor support (equivalent to __attribute__((constructor)))
+nix-bindings-macros = { path = "nix-bindings-macros" }
+# ctor is needed because we use auto_register = true
 ctor = "0.2"
 
 # Speed up bindgen compilation during dev builds (mirrors upstream recommendation)
