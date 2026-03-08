@@ -100,117 +100,115 @@ nix eval --plugin-files plugin/target/release/libnix_hello_world_plugin.so \
 # => true
 ```
 
+## What the high-level `nix-bindings` crate already provides
+
+The companion `nix-bindings` crate (same repo, `nix-bindings/src/lib.rs`) wraps the sys
+crate and provides:
+
+- **`Context`** — RAII wrapper around `nix_c_context`; `Drop` calls `nix_c_context_free`.
+  Also calls `nix_libutil_init`, `nix_libstore_init`, `nix_libexpr_init` in `Context::new()`.
+- **`EvalStateBuilder` / `EvalState`** — builder pattern, RAII drops.
+- **`Store` / `StorePath`** — wraps store operations.
+- **`Value<'a>`** — struct with `value_type() -> ValueType`, and `as_int()`, `as_float()`,
+  `as_bool()`, `as_string()`, `force()`, `force_deep()` methods returning `Result<T>`.
+  `Drop` calls `nix_value_decref`. `as_string()` uses `nix_string_realise` (not the awkward
+  callback approach).
+- **`ValueType`** enum — `Int`, `Float`, `Bool`, `String`, `Path`, `Null`, `Attrs`, `List`,
+  `Function`, `External`, `Thunk`.
+- **`Error`** enum and `Result<T>` alias — covers `Unknown`, `Overflow`, `KeyNotFound`,
+  `EvalError`, `InvalidType`, `NullPointer`, `StringConversion`.
+- **`check_err()`** internal helper converting `nix_err` codes to `Result<()>`.
+
+It does NOT expose anything for primop/plugin authoring (`nix_alloc_primop`,
+`nix_register_primop` are absent from the high-level API). The `sys` module is re-exported
+as `pub mod sys { pub use nix_bindings_sys::*; }` (doc-hidden) as an escape hatch.
+
 ## Improvements to nix-bindings for Plugin Authoring
 
-After writing a plugin using the raw `nix-bindings-sys` crate and studying the full
-generated bindings (~1200 lines across the Nix C API surface), here are concrete areas
-where a higher-level `nix-bindings` crate could make plugin authoring significantly easier.
+After writing a plugin using the raw `nix-bindings-sys` crate, studying the full generated
+bindings (~1200 lines), and reading the high-level crate source, here are the remaining gaps.
 
-### 1. Safe context wrapper that propagates errors as `Result`
+### 1. Safe context wrapper that propagates errors as `Result` — MOSTLY DONE
 
-Currently every API call takes `*mut nix_c_context` and returns `nix_err` (a raw `c_int`).
-Authors must check each return code manually and separately query the context for an error
-message. A `NixContext` struct with methods that return `Result<T, NixError>` would make
-error handling both safer and more idiomatic:
+The high-level crate has `Context` (RAII, Drop), `check_err()` converting `nix_err` to
+`Result`, and a typed `Error` enum. However, `check_err` loses the human-readable error
+message — it maps error codes to generic strings like `"Unknown error"` or
+`"Evaluation error"` rather than calling `nix_err_msg(context)` to retrieve the actual
+message Nix stored in the context. So `EvalError("Evaluation error")` is returned instead
+of e.g. `EvalError("undefined variable 'foo'")`. Fixing this would require threading the
+context into `check_err` or storing errors directly on the context struct.
 
-```rust
-// Current state: manual checking
-let rc = nix_register_primop(ctx, primop);
-if rc != 0 {
-    eprintln!("failed: {}", get_error_msg(ctx));
-}
+### 2. Primop registration macro or builder — MISSING ENTIRELY
 
-// Ideal API
-ctx.register_primop(&primop)?;
-```
+The high-level crate has no primop support at all. `nix_alloc_primop` and
+`nix_register_primop` are not wrapped. Plugin authors must drop to `nix_bindings::sys`
+(the re-exported `nix-bindings-sys`) and write the full 20-line unsafe registration dance
+themselves, including:
+- manual CString conversions for name, doc, and each arg name
+- building a null-terminated `*mut *const c_char` array with a non-obvious cast
+- arity specified as a separate integer redundant with the arg names array
+- null-checking the returned `PrimOp *`
+- explicit `#[ctor::ctor]` for plugin `.init_array` placement
 
-The context should also implement RAII (`Drop`) so it's freed automatically.
+This is the biggest gap for plugin authoring. A `PrimOpBuilder` or `#[nix_builtin]`
+proc-macro would be the highest-leverage addition to the high-level crate:
 
-### 2. Primop registration macro or builder
-
-The full sequence to register one builtin is:
-- Create a context
-- Build a null-terminated `*mut *const c_char` array of arg name pointers (with non-obvious
-  mutability cast for a parameter that C treats as `const char **` but bindgen emits as `*mut *const c_char`)
-- Call `nix_alloc_primop` with arity, name, args, docstring, user_data
-- Null-check the returned `PrimOp *`
-- Call `nix_register_primop`
-- Free the context
-
-A `register_primop!` macro or a `PrimOpBuilder` that encodes the arg names in the type
-system (so arity is inferred rather than specified as a separate integer) would cut this
-to a few lines and eliminate the unsafe CString juggling. The `#[ctor]` placement requirement
-could also be bundled into such a macro.
-
-Ideal form:
 ```rust
 #[nix_builtin(name = "helloWorld", args = ["_"], doc = "Returns Hello, World!")]
-fn hello_world(_state: &EvalState, _args: &[NixValue]) -> NixResult {
-    NixValue::string("Hello, World!")
+fn hello_world(_state: &EvalState, _args: &[Value]) -> Result<String> {
+    Ok("Hello, World!".into())
 }
 ```
 
-### 3. Typed `NixValue` enum for reading arguments
+### 3. Typed `NixValue` enum for reading arguments — PARTIAL
 
-Primop callbacks receive `*mut *mut nix_value` — an array of opaque pointers. To read
-an argument the author must call `nix_get_type` and then the matching `nix_get_*` function
-(`nix_get_string` with a callback, `nix_get_int`, `nix_get_bool`, etc.). `nix_get_string`
-is particularly awkward: it uses a C callback pattern instead of returning a pointer, because
-strings can carry store-path context.
+The high-level crate has `Value<'a>` with `value_type() -> ValueType` and typed accessors
+(`as_int()`, `as_string()`, etc.). `as_string()` uses `nix_string_realise` which is cleaner
+than the raw callback approach. `Drop` calls `nix_value_decref`. `ValueType` is a full enum.
 
-A `NixValue` enum that matches on type and returns safe Rust types would eliminate all of
-this:
+What's still missing:
+- **No enum-based matching** — you can't `match value.into_typed() { NixValue::Int(n) => ... }`.
+  You must call `value_type()` and then the appropriate accessor separately, with two
+  potential failure points.
+- **No `Attrs` or `List` traversal methods** — `ValueType::Attrs` and `ValueType::List`
+  exist as variants but there are no corresponding `as_attrs()`, `get_attr()`, `iter_list()`
+  etc. methods on `Value`. Accessing structured values requires dropping to `sys`.
+- **No `Clone`** — `Value` cannot be cloned (no `nix_value_incref` wrapping), which
+  limits how values can be stored or passed around.
 
-```rust
-pub enum NixValue<'a> {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(Cow<'a, str>),
-    Path(PathBuf),
-    List(NixList<'a>),
-    Attrs(NixAttrs<'a>),
-    // ...
-}
+### 4. Smart pointer for GC-managed values — HALF DONE
 
-impl NixValue<'_> {
-    pub fn from_raw(ctx: &NixContext, state: &EvalState, v: *mut nix_value) -> Result<Self, NixError>;
-}
-```
+`Value::Drop` already calls `nix_value_decref`, which is the important half. But `Value`
+does not implement `Clone` (which would call `nix_value_incref`), so values cannot be
+duplicated or stored independently of the eval state they borrow. The lifetime `Value<'a>`
+tied to `&'a EvalState` prevents storing values in structs or returning them from closures.
+An `Arc`-like `OwnedValue` that calls incref on clone and decref on drop would decouple
+values from the state's lifetime.
 
-### 4. Smart pointer for GC-managed values
+### 5. Suppress libc types from the generated bindings — NOT DONE (sys-level issue)
 
-`nix_value` objects are managed by Boehm GC. The API exposes `nix_value_incref` /
-`nix_value_decref` and `nix_gc_incref` / `nix_gc_decref`. Plugin authors who allocate
-values with `nix_alloc_value` must remember to balance these calls. A `GcValue` smart
-pointer (like `Rc` but backed by Nix's GC) with `Clone`/`Drop` impl would make ownership
-automatic.
+The generated `bindings.rs` still contains ~700 lines of `__u_char`, `__int8_t`, `__dev_t`,
+etc. that leak from transitive `#include`s. The high-level crate re-exports `sys` as
+doc-hidden, which hides these from docs, but they still bloat the `sys` module and clutter
+IDE auto-complete when someone needs to reach into `sys`. The bindgen config in
+`nix-bindings-sys/build.rs` should add `allowlist_type("nix_.*")` and
+`allowlist_function("nix_.*")` to restrict output to the Nix API surface.
 
-### 5. Suppress libc types from the generated bindings
-
-The generated `bindings.rs` contains ~700 lines of `__u_char`, `__int8_t`, `__dev_t`, etc.
-libc typedefs that leak from `#include <stdint.h>` in the Nix headers. These pollute
-auto-complete and add noise. The bindgen config should use `allowlist_type` /
-`allowlist_function` to restrict output to only `nix_*` names, and replace C primitive
-types with Rust equivalents from the `libc` crate.
-
-### 6. Fix the `*mut *const c_char` mutability quirk
+### 6. Fix the `*mut *const c_char` mutability quirk — NOT DONE (upstream C API issue)
 
 `nix_alloc_primop`'s `args` parameter is declared as `const char **` in the C header
-(meaning: pointer to array of const char pointers), but bindgen emits it as
-`*mut *const c_char` — so a stack-allocated `[*const c_char; N]` array requires an
-explicit `as *mut *const c_char` cast that has no safety justification. The C signature
-should probably be `const char * const *` (pointer to immutable array), which bindgen would
-emit as `*const *const c_char` and eliminate the cast. A bug report or PR upstream is
-warranted.
+(meaning: mutable pointer to const char pointers), but the intent is clearly
+`const char * const *` (pointer to an immutable array of const char pointers). Bindgen
+faithfully emits `*mut *const c_char`, so callers must cast a `&[*const c_char]` slice's
+`.as_ptr()` with `as *mut *const c_char` — an unsafe cast that Rust rightly flags as
+suspicious. The fix is a one-line change to `nix_api_value.h` in the Nix repo upstream.
 
-### 7. Version compatibility matrix
+### 7. Version compatibility documentation and enforcement — NOT DONE
 
-`nix-bindings-sys` currently uses its own crate version (2.32.4) to signal which Nix
-version's headers it was generated from. But the crate regenerates bindings from whatever
-headers are in the build environment, so the version number is aspirational rather than
-enforced. A Cargo feature or build.rs check that validates `nix --version` matches the
-expected range would catch version skew earlier. The nixpkgs pin (`nixos-unstable` is
-required because `nixos-25.05` only goes up to `nix_2_30`) should be documented prominently
-in the README.
+`nix-bindings-sys` version 2.32.4 implies Nix 2.32 headers, but does not enforce this.
+The bindings are regenerated from whatever Nix dev headers are present at build time; if
+the build environment provides Nix 2.30 headers, the crate compiles silently with a
+different API surface. Additionally, `nix_2_32` is absent from nixos-25.05 (only goes up
+to nix_2_30); users must use nixos-unstable. Neither the crate README nor flake.nix
+document this. A build.rs check against `pkg-config --modversion nix-expr-c` and a clearer
+README section on nixpkgs requirements would prevent silent mismatch.
