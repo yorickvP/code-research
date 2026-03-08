@@ -2,7 +2,7 @@
   description = "A Nix plugin that adds builtins.helloWorld using nix-bindings";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-25.05";
+    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     naersk = {
       url = "github:nix-community/naersk";
@@ -15,8 +15,8 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Nix 2.32 is required to match the nix-bindings-sys = "2.32.4" crate version.
-        # The C API headers and libraries must match the crate's expected version.
+        # Use Nix 2.32 dev headers to match the nix-bindings-sys = "2.32.4" crate.
+        # nix_2_32 requires nixpkgs-unstable (not available in nixos-25.05).
         nixForPlugin = pkgs.nixVersions.nix_2_32;
 
         naersk' = pkgs.callPackage naersk { };

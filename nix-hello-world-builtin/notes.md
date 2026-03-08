@@ -75,3 +75,51 @@ nix eval --plugin-files ./result/lib/libnix_hello_world_plugin.so --expr 'builti
 - Nix's `nix_api_value.h` contains all the primop-related C API
 - `nix-bindings` (high-level) doesn't yet expose primop registration as safe Rust,
   so we use `nix-bindings-sys` (raw FFI) directly
+
+## Build & Test Results
+
+### Fixes Required During Build
+- nixpkgs 25.05 does not have `nix_2_32`; switched to `nixpkgs-unstable` which has nix 2.32.6
+- `nix_alloc_primop`'s `args` parameter is `*mut *const i8` in generated bindings (not `*const`);
+  fixed with `arg_names.as_ptr() as *mut *const c_char` cast
+
+### Successful Build
+```
+nix develop --command bash -c 'cd plugin && cargo build --release'
+# => Finished `release` profile [optimized]
+```
+
+### Successful Test
+```
+nix eval --plugin-files plugin/target/release/libnix_hello_world_plugin.so \
+         --expr 'builtins.helloWorld null'
+# => "Hello, World!"
+
+nix eval --plugin-files plugin/target/release/libnix_hello_world_plugin.so \
+         --expr 'builtins ? helloWorld'
+# => true
+```
+
+## Build & Test Results
+
+### Issues Found During Build
+1. **nix_2_32 not in nixos-25.05** — had to switch to nixpkgs-unstable (which has nix 2.32.6)
+2. **Type mutability mismatch** — generated bindings declare `nix_alloc_primop`'s `args` param
+   as `*mut *const i8` (mutable pointer to const pointer), but our array was `*const *const i8`.
+   Fixed with: `arg_names.as_ptr() as *mut *const c_char`
+
+### Successful Build
+Built with `nix develop --command bash -c 'cd plugin && cargo build --release'`
+- nix-bindings-sys generated bindings from Nix 2.32.6 headers via bindgen ✓
+- Plugin compiled to `plugin/target/release/libnix_hello_world_plugin.so` ✓
+
+### Successful Test
+```
+$ nix eval --plugin-files plugin/target/release/libnix_hello_world_plugin.so \
+           --expr 'builtins.helloWorld null'
+"Hello, World!"
+
+$ nix eval --plugin-files plugin/target/release/libnix_hello_world_plugin.so \
+           --expr 'builtins ? helloWorld'
+true
+```

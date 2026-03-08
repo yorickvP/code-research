@@ -64,7 +64,7 @@ fn register_hello_world_builtin() {
             Some(hello_world_primop),
             1,                          // arity: takes one (ignored) argument
             name.as_ptr(),
-            arg_names.as_ptr(),
+            arg_names.as_ptr() as *mut *const c_char,
             doc.as_ptr(),
             std::ptr::null_mut(),       // no user_data needed
         );
